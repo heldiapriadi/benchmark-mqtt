@@ -123,7 +123,14 @@ detect_os() {
                 echo "ubuntu${VERSION_ID%%.*}"
                 ;;
             debian)
-                echo "debian${VERSION_ID%%.*}"
+                # Map debian versions: debian11 -> try debian12 as fallback, debian12 -> debian12
+                local debian_version="${VERSION_ID%%.*}"
+                if [ "$debian_version" = "11" ]; then
+                    # Try debian12 as it's more commonly available in releases
+                    echo "debian12"
+                else
+                    echo "debian${debian_version}"
+                fi
                 ;;
             *)
                 log_warn "Unknown OS distribution, defaulting to ubuntu22.04"
@@ -255,6 +262,15 @@ main() {
         "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-${OS}-${ARCH_SUFFIX}-quic.tar.gz"
         "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-linux-${ARCH_SUFFIX}.tar.gz"
     )
+    
+    # Add fallback for debian11 -> debian12 (debian11 builds may not be available)
+    if [[ "$OS" == "debian11" ]]; then
+        DOWNLOAD_URLS+=(
+            "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-debian12-${ARCH_SUFFIX}.tar.gz"
+            "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-debian12-${ARCH_SUFFIX}-quic.tar.gz"
+        )
+        log_info "Added debian12 fallback URLs for debian11"
+    fi
     
     DOWNLOAD_SUCCESS=false
     for DOWNLOAD_URL in "${DOWNLOAD_URLS[@]}"; do
