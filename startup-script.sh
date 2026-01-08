@@ -1,386 +1,273 @@
 #!/bin/bash
 
-# Google Cloud VM Startup Script untuk EMQX Stress Test dengan emqtt-bench
-# Script ini akan:
-# 1. Update sistem
-# 2. Install dependencies (Erlang, libatomic, build tools)
-# 3. Clone dan build emqtt-bench
-# 4. Setup resource limits untuk stress test
-# 5. Jalankan benchmark sesuai konfigurasi
+# Startup Script untuk EMQTT-Bench di GCP Instance Template
+# Script ini membaca metadata untuk menentukan mode testing
+# Mode: conn, pub, sub, atau pubsub
 
 set -e
 
-# ============================================================================
-# KONFIGURASI
-# ============================================================================
+# Log semua output
+exec > >(tee -a /var/log/emqtt-bench-startup.log)
+exec 2>&1
 
-# MQTT Broker Configuration
-MQTT_HOST="${MQTT_HOST:-localhost}"
-MQTT_PORT="${MQTT_PORT:-1883}"
-MQTT_VERSION="${MQTT_VERSION:-5}"
+echo "=== EMQTT-Bench Startup Script ==="
+echo "Timestamp: $(date)"
+echo "Hostname: $(hostname)"
 
-# Benchmark Configuration
-BENCHMARK_TYPE="${BENCHMARK_TYPE:-conn}"  # conn, pub, atau sub
-CLIENT_COUNT="${CLIENT_COUNT:-10000}"
-CONNECTION_RATE="${CONNECTION_RATE:-100}"
-INTERVAL="${INTERVAL:-10}"
-
-# Publisher specific config
-PUB_MESSAGE_INTERVAL="${PUB_MESSAGE_INTERVAL:-1000}"
-PUB_MESSAGE_SIZE="${PUB_MESSAGE_SIZE:-256}"
-PUB_TOPIC="${PUB_TOPIC:-bench/%i}"
-
-# Subscriber specific config
-SUB_TOPIC="${SUB_TOPIC:-bench/%i}"
-SUB_QOS="${SUB_QOS:-0}"
-
-# Additional flags
-USERNAME="${USERNAME:-}"
-PASSWORD="${PASSWORD:-}"
-USE_SSL="${USE_SSL:-false}"
-ENABLE_PROMETHEUS="${ENABLE_PROMETHEUS:-true}"
-PROMETHEUS_PORT="${PROMETHEUS_PORT:-8081}"
-
-# Logging
-LOG_DIR="/var/log/emqx-benchmark"
-LOG_FILE="${LOG_DIR}/benchmark-$(date +%Y%m%d-%H%M%S).log"
-
-# ============================================================================
-# LOGGING FUNCTIONS
-# ============================================================================
-
-log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}"
+# Fungsi untuk mendapatkan metadata GCP
+get_metadata() {
+    curl -s -f "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" \
+         -H "Metadata-Flavor: Google" 2>/dev/null || echo ""
 }
 
-error() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" | tee -a "${LOG_FILE}" >&2
-    exit 1
-}
+# Baca konfigurasi dari metadata
+TEST_MODE=$(get_metadata "test-mode")              # conn, pub, sub, pubsub
+BROKER_HOST=$(get_metadata "broker-host")          # MQTT broker host
+BROKER_PORT=$(get_metadata "broker-port")          # MQTT broker port (default: 1883)
+CLIENT_COUNT=$(get_metadata "client-count")        # Jumlah client
+QOS=$(get_metadata "qos")                          # QoS level (0, 1, 2)
+TOPIC=$(get_metadata "topic")                      # MQTT topic
+MESSAGE_SIZE=$(get_metadata "message-size")        # Ukuran pesan dalam bytes
+MESSAGE_COUNT=$(get_metadata "message-count")      # Jumlah pesan per client
+INTERVAL=$(get_metadata "interval")                # Interval antar pesan (ms)
+USERNAME=$(get_metadata "mqtt-username")           # MQTT username
+PASSWORD=$(get_metadata "mqtt-password")           # MQTT password
+KEEPALIVE=$(get_metadata "keepalive")              # Keepalive interval
+AUTO_START=$(get_metadata "auto-start")            # Auto start test (true/false)
 
-# ============================================================================
-# SETUP LOGGING
-# ============================================================================
+# Set default values
+TEST_MODE=${TEST_MODE:-pub}
+BROKER_HOST=${BROKER_HOST:-localhost}
+BROKER_PORT=${BROKER_PORT:-1883}
+CLIENT_COUNT=${CLIENT_COUNT:-100}
+QOS=${QOS:-1}
+TOPIC=${TOPIC:-bench/%i}
+MESSAGE_SIZE=${MESSAGE_SIZE:-256}
+MESSAGE_COUNT=${MESSAGE_COUNT:-1000}
+INTERVAL=${INTERVAL:-10}
+KEEPALIVE=${KEEPALIVE:-300}
+AUTO_START=${AUTO_START:-false}
 
-mkdir -p "${LOG_DIR}"
-touch "${LOG_FILE}"
-log "===== Starting EMQX Stress Test Startup Script ====="
+echo "Configuration:"
+echo "  TEST_MODE: $TEST_MODE"
+echo "  BROKER: $BROKER_HOST:$BROKER_PORT"
+echo "  CLIENTS: $CLIENT_COUNT"
+echo "  QOS: $QOS"
+echo "  TOPIC: $TOPIC"
+echo "  AUTO_START: $AUTO_START"
 
-# ============================================================================
-# DETECT OS
-# ============================================================================
+# Update system
+echo "Updating system packages..."
+apt-get update -qq
+apt-get install -y wget git build-essential curl jq
 
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS=$ID
-else
-    error "Cannot detect operating system"
-fi
-
-log "Detected OS: $OS"
-
-# ============================================================================
-# UPDATE SYSTEM
-# ============================================================================
-
-log "Updating system packages..."
-if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
-    apt-get update
-    apt-get upgrade -y
-elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
-    yum update -y
-fi
-
-# ============================================================================
-# INSTALL DEPENDENCIES
-# ============================================================================
-
-log "Installing dependencies..."
-
-if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
-    apt-get install -y \
-        curl \
-        wget \
-        git \
-        build-essential \
-        libatomic1 \
-        ca-certificates
-elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
-    yum install -y \
-        curl \
-        wget \
-        git \
-        gcc \
-        make \
-        libatomic \
-        ca-certificates
-fi
-
-# ============================================================================
-# INSTALL ERLANG/OTP
-# ============================================================================
-
-log "Checking if Erlang/OTP is installed..."
+# Install Erlang/OTP
+echo "Installing Erlang/OTP..."
 if ! command -v erl &> /dev/null; then
-    log "Installing Erlang/OTP..."
-    
-    if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]]; then
-        # Add Erlang Solutions repository
-        wget https://packages.erlang-solutions.com/erlang-solutions_2.0_all.deb
-        dpkg -i erlang-solutions_2.0_all.deb
-        apt-get update
-        apt-get install -y erlang-base erlang-dev
-    elif [[ "$OS" == "centos" ]] || [[ "$OS" == "rhel" ]]; then
-        yum install -y erlang
-    fi
-else
-    ERLANG_VERSION=$(erl -eval 'erlang:halt(0)' -noshell 2>&1 | grep "Erlang/OTP" || echo "unknown")
-    log "Erlang/OTP already installed: $ERLANG_VERSION"
+    wget -q https://packages.erlang-solutions.com/erlang-solutions_2.0_all.deb
+    dpkg -i erlang-solutions_2.0_all.deb
+    apt-get update -qq
+    apt-get install -y erlang
+    rm erlang-solutions_2.0_all.deb
 fi
 
-# ============================================================================
-# CLONE & BUILD EMQTT-BENCH
-# ============================================================================
-
-BENCH_DIR="/opt/emqtt-bench"
-
-log "Cloning emqtt-bench repository..."
-if [ -d "$BENCH_DIR" ]; then
-    log "emqtt-bench already exists, updating..."
-    cd "$BENCH_DIR"
-    git pull origin master
-else
-    git clone https://github.com/emqx/emqtt-bench.git "$BENCH_DIR"
-    cd "$BENCH_DIR"
+# Install Rebar3
+echo "Installing Rebar3..."
+if ! command -v rebar3 &> /dev/null; then
+    cd /opt
+    wget -q https://s3.amazonaws.com/rebar3/rebar3
+    chmod +x rebar3
+    mv rebar3 /usr/local/bin/
 fi
 
-log "Building emqtt-bench..."
-cd "$BENCH_DIR"
-make clean
-make 2>&1 | tee -a "${LOG_FILE}"
-
-if [ ! -f "$BENCH_DIR/bin/emqtt_bench" ]; then
-    error "Build failed - emqtt_bench binary not found"
+# Clone and build emqtt-bench
+echo "Building emqtt-bench..."
+if [ ! -d "/opt/emqtt-bench" ]; then
+    cd /opt
+    git clone -q https://github.com/emqx/emqtt-bench.git
+    cd emqtt-bench
+    make
+    ln -sf /opt/emqtt-bench/_build/default/bin/emqtt_bench /usr/local/bin/emqtt_bench
 fi
 
-log "Build successful!"
+# Create working directory
+mkdir -p /opt/emqtt-bench-runner
+cd /opt/emqtt-bench-runner
 
-# ============================================================================
-# SETUP RESOURCE LIMITS
-# ============================================================================
+# Build command options
+CMD_BASE="emqtt_bench"
+CMD_OPTS="-h $BROKER_HOST -p $BROKER_PORT -c $CLIENT_COUNT -q $QOS -k $KEEPALIVE"
 
-log "Setting up resource limits for stress testing..."
-
-# Increase file descriptors
-ulimit -n 200000
-log "Set max open files: 200000"
-
-# Increase network parameters
-sysctl -w net.ipv4.ip_local_port_range="1025 65534" 2>&1 | tee -a "${LOG_FILE}"
-sysctl -w net.core.somaxconn=65535 2>&1 | tee -a "${LOG_FILE}"
-sysctl -w net.ipv4.tcp_max_syn_backlog=65535 2>&1 | tee -a "${LOG_FILE}"
-
-# Permanent settings
-cat >> /etc/sysctl.conf << EOF
-net.ipv4.ip_local_port_range = 1025 65534
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-EOF
-
-log "Resource limits configured"
-
-# ============================================================================
-# BUILD BENCHMARK COMMAND
-# ============================================================================
-
-log "Building benchmark command..."
-
-BENCH_CMD="$BENCH_DIR/bin/emqtt_bench $BENCHMARK_TYPE"
-BENCH_CMD="$BENCH_CMD -h $MQTT_HOST"
-BENCH_CMD="$BENCH_CMD -p $MQTT_PORT"
-BENCH_CMD="$BENCH_CMD -V $MQTT_VERSION"
-BENCH_CMD="$BENCH_CMD -c $CLIENT_COUNT"
-BENCH_CMD="$BENCH_CMD -R $CONNECTION_RATE"
-BENCH_CMD="$BENCH_CMD -i $INTERVAL"
-
-# Add authentication if provided
 if [ -n "$USERNAME" ]; then
-    BENCH_CMD="$BENCH_CMD -u $USERNAME"
+    CMD_OPTS="$CMD_OPTS -u $USERNAME"
 fi
 
 if [ -n "$PASSWORD" ]; then
-    BENCH_CMD="$BENCH_CMD -P $PASSWORD"
+    CMD_OPTS="$CMD_OPTS -P $PASSWORD"
 fi
 
-# Add SSL if enabled
-if [ "$USE_SSL" = "true" ]; then
-    BENCH_CMD="$BENCH_CMD -S"
-fi
+# Create run script based on test mode
+cat > /opt/emqtt-bench-runner/run-test.sh << EOF
+#!/bin/bash
 
-# Add Prometheus if enabled
-if [ "$ENABLE_PROMETHEUS" = "true" ]; then
-    BENCH_CMD="$BENCH_CMD --prometheus"
-    BENCH_CMD="$BENCH_CMD --restapi 0.0.0.0:$PROMETHEUS_PORT"
-fi
+LOG_DIR="/var/log/emqtt-bench-tests"
+mkdir -p \$LOG_DIR
 
-# Type-specific options
-case "$ " in
-    pub)
-        BENCH_CMD="$BENCH_CMD -I $PUB_MESSAGE_INTERVAL"
-        BENCH_CMD="$BENCH_CMD -t $PUB_TOPIC"
-        BENCH_CMD="$BENCH_CMD -s $PUB_MESSAGE_SIZE"
+TIMESTAMP=\$(date +%Y%m%d_%H%M%S)
+HOSTNAME=\$(hostname)
+
+echo "=== Starting EMQTT-Bench Test ==="
+echo "Mode: $TEST_MODE"
+echo "Broker: $BROKER_HOST:$BROKER_PORT"
+echo "Clients: $CLIENT_COUNT"
+echo "Timestamp: \$TIMESTAMP"
+echo "Hostname: \$HOSTNAME"
+
+case "$TEST_MODE" in
+    conn)
+        echo "Running CONNECTION test..."
+        $CMD_BASE conn $CMD_OPTS -i $INTERVAL \\
+            2>&1 | tee \$LOG_DIR/conn_\${HOSTNAME}_\${TIMESTAMP}.log
         ;;
+    
+    pub)
+        echo "Running PUBLISH test..."
+        $CMD_BASE pub $CMD_OPTS \\
+            -t "$TOPIC" \\
+            -s $MESSAGE_SIZE \\
+            -C $MESSAGE_COUNT \\
+            -I $INTERVAL \\
+            2>&1 | tee \$LOG_DIR/pub_\${HOSTNAME}_\${TIMESTAMP}.log
+        ;;
+    
     sub)
-        BENCH_CMD="$BENCH_CMD -t $SUB_TOPIC"
-        BENCH_CMD="$BENCH_CMD -q $SUB_QOS"
+        echo "Running SUBSCRIBE test..."
+        $CMD_BASE sub $CMD_OPTS \\
+            -t "$TOPIC" \\
+            2>&1 | tee \$LOG_DIR/sub_\${HOSTNAME}_\${TIMESTAMP}.log
+        ;;
+    
+    pubsub)
+        echo "Running PUBLISH+SUBSCRIBE test..."
+        
+        # Start subscribers first
+        $CMD_BASE sub $CMD_OPTS \\
+            -t "$TOPIC" \\
+            2>&1 | tee \$LOG_DIR/sub_\${HOSTNAME}_\${TIMESTAMP}.log &
+        
+        SUB_PID=\$!
+        echo "Subscribers started (PID: \$SUB_PID), waiting 10 seconds..."
+        sleep 10
+        
+        # Start publishers
+        $CMD_BASE pub $CMD_OPTS \\
+            -t "$TOPIC" \\
+            -s $MESSAGE_SIZE \\
+            -C $MESSAGE_COUNT \\
+            -I $INTERVAL \\
+            2>&1 | tee \$LOG_DIR/pub_\${HOSTNAME}_\${TIMESTAMP}.log
+        
+        echo "Publishers completed, stopping subscribers..."
+        sleep 5
+        kill \$SUB_PID 2>/dev/null
+        ;;
+    
+    *)
+        echo "ERROR: Invalid test mode: $TEST_MODE"
+        echo "Valid modes: conn, pub, sub, pubsub"
+        exit 1
         ;;
 esac
 
-log "Benchmark command: $BENCH_CMD"
+echo "=== Test completed ==="
+echo "End time: \$(date)"
+echo "Logs: \$LOG_DIR"
 
-# ============================================================================
-# CREATE SYSTEMD SERVICE (OPTIONAL)
-# ============================================================================
+# Report to metadata (optional - untuk monitoring)
+curl -X PUT --data "completed" \\
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/emqtt-bench/status" \\
+    -H "Metadata-Flavor: Google" 2>/dev/null || true
+EOF
 
-log "Creating systemd service file..."
+chmod +x /opt/emqtt-bench-runner/run-test.sh
 
-cat > /etc/systemd/system/emqx-benchmark.service << 'EOF'
+# Create systemd service
+cat > /etc/systemd/system/emqtt-bench.service << EOF
 [Unit]
-Description=EMQX Benchmark Service
+Description=EMQTT Bench Test Service
 After=network.target
 
 [Service]
-Type=simple
+Type=oneshot
 User=root
-WorkingDirectory=/opt/emqtt-bench
-ExecStart=$BENCH_CMD
-StandardOutput=append:$LOG_FILE
-StandardError=append:$LOG_FILE
-Restart=on-failure
-RestartSec=10
+WorkingDirectory=/opt/emqtt-bench-runner
+ExecStart=/opt/emqtt-bench-runner/run-test.sh
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ============================================================================
-# SAVE CONFIGURATION
-# ============================================================================
+systemctl daemon-reload
 
-CONFIG_FILE="/opt/emqx-benchmark-config.sh"
-log "Saving configuration to $CONFIG_FILE..."
+# Create info file
+cat > /opt/emqtt-bench-runner/INFO.txt << EOF
+=== EMQTT-Bench Runner Configuration ===
 
-cat > "$CONFIG_FILE" << EOF
-# EMQX Benchmark Configuration
-# Auto-generated by startup script at $(date)
+Instance: $(hostname)
+Test Mode: $TEST_MODE
+Broker: $BROKER_HOST:$BROKER_PORT
+Clients: $CLIENT_COUNT
+QoS: $QOS
+Topic: $TOPIC
 
-# MQTT Broker Configuration
-export MQTT_HOST="${MQTT_HOST}"
-export MQTT_PORT="${MQTT_PORT}"
-export MQTT_VERSION="${MQTT_VERSION}"
+MANUAL COMMANDS:
+----------------
+Start test:
+  sudo systemctl start emqtt-bench
 
-# Benchmark Configuration
-export BENCHMARK_TYPE="${BENCHMARK_TYPE}"
-export CLIENT_COUNT="${CLIENT_COUNT}"
-export CONNECTION_RATE="${CONNECTION_RATE}"
-export INTERVAL="${INTERVAL}"
+View logs:
+  sudo journalctl -u emqtt-bench -f
 
-# Publisher specific config
-export PUB_MESSAGE_INTERVAL="${PUB_MESSAGE_INTERVAL}"
-export PUB_MESSAGE_SIZE="${PUB_MESSAGE_SIZE}"
-export PUB_TOPIC="${PUB_TOPIC}"
+Test logs location:
+  /var/log/emqtt-bench-tests/
 
-# Subscriber specific config
-export SUB_TOPIC="${SUB_TOPIC}"
-export SUB_QOS="${SUB_QOS}"
+Run script directly:
+  /opt/emqtt-bench-runner/run-test.sh
 
-# Additional flags
-export USERNAME="${USERNAME}"
-export PASSWORD="${PASSWORD}"
-export USE_SSL="${USE_SSL}"
-export ENABLE_PROMETHEUS="${ENABLE_PROMETHEUS}"
-export PROMETHEUS_PORT="${PROMETHEUS_PORT}"
-
-# Benchmark command
-export BENCH_CMD="$BENCH_CMD"
-export BENCH_DIR="$BENCH_DIR"
+EMQTT-Bench Command:
+  emqtt_bench --help
 EOF
 
-chmod +x "$CONFIG_FILE"
+echo ""
+echo "=========================================="
+echo "EMQTT-Bench Installation Complete!"
+echo "=========================================="
+echo "Mode: $TEST_MODE"
+echo "Broker: $BROKER_HOST:$BROKER_PORT"
+echo "Clients: $CLIENT_COUNT"
+echo ""
 
-# ============================================================================
-# CREATE HELPER SCRIPTS
-# ============================================================================
-
-log "Creating helper scripts..."
-
-# Script untuk run benchmark
-cat > /usr/local/bin/run-benchmark << 'EOF'
-#!/bin/bash
-source /opt/emqx-benchmark-config.sh
-$BENCH_CMD
-EOF
-
-chmod +x /usr/local/bin/run-benchmark
-
-# Script untuk check status
-cat > /usr/local/bin/benchmark-status << 'EOF'
-#!/bin/bash
-CONFIG_FILE="/opt/emqx-benchmark-config.sh"
-if [ -f "$CONFIG_FILE" ]; then
-    echo "=== EMQX Benchmark Configuration ==="
-    grep "export" "$CONFIG_FILE" | grep -v "^#"
+# Auto-start test if enabled
+if [ "$AUTO_START" = "true" ]; then
+    echo "AUTO_START enabled, starting test in 5 seconds..."
+    sleep 5
+    systemctl start emqtt-bench
+    echo "Test started! Monitor with: journalctl -u emqtt-bench -f"
 else
-    echo "Configuration file not found"
+    echo "To start test manually:"
+    echo "  sudo systemctl start emqtt-bench"
+    echo ""
+    echo "Or run directly:"
+    echo "  /opt/emqtt-bench-runner/run-test.sh"
 fi
-EOF
 
-chmod +x /usr/local/bin/benchmark-status
+echo ""
+echo "Installation log: /var/log/emqtt-bench-startup.log"
+echo "Configuration: /opt/emqtt-bench-runner/INFO.txt"
+echo "=========================================="
 
-# ============================================================================
-# PRINT SUMMARY
-# ============================================================================
-
-cat << EOF
-
-╔════════════════════════════════════════════════════════════════╗
-║     EMQX Stress Test - Setup Complete!                        ║
-╚════════════════════════════════════════════════════════════════╝
-
-📍 Installation Directory: $BENCH_DIR
-📍 Configuration File:     $CONFIG_FILE
-📍 Log File:              $LOG_FILE
-
-🚀 Quick Start Commands:
-
-1. Run benchmark directly:
-   run-benchmark
-
-2. Run benchmark in background:
-   nohup run-benchmark > $LOG_FILE 2>&1 &
-
-3. View configuration:
-   benchmark-status
-
-4. Access Prometheus metrics (if enabled):
-   curl http://localhost:$PROMETHEUS_PORT/metrics
-
-📊 Current Configuration:
-   • MQTT Host:        $MQTT_HOST:$MQTT_PORT
-   • Benchmark Type:   $BENCHMARK_TYPE
-   • Client Count:     $CLIENT_COUNT
-   • Connection Rate:  $CONNECTION_RATE/s
-
-📝 For manual customization, edit:
-   $CONFIG_FILE
-
-🔍 To enable systemd service:
-   systemctl daemon-reload
-   systemctl enable emqx-benchmark
-   systemctl start emqx-benchmark
-
-Log file: $LOG_FILE
-
-EOF
-
-log "===== Startup Script Complete ====="
+touch /var/log/emqtt-bench-installation-complete
+echo "Startup script finished at $(date)"
