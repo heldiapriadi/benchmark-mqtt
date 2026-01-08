@@ -107,7 +107,16 @@ main() {
     
     # Read configuration from metadata
     MQTT_HOST=$(get_metadata "mqtt-host" "")
-    MQTT_PORT=$(get_metadata "mqtt-port" "1883")
+    USE_SSL=$(get_metadata "use-ssl" "false")
+    
+    # Set default port based on SSL usage
+    if [ "$USE_SSL" = "true" ]; then
+        DEFAULT_PORT="8883"
+    else
+        DEFAULT_PORT="1883"
+    fi
+    
+    MQTT_PORT=$(get_metadata "mqtt-port" "$DEFAULT_PORT")
     MQTT_USERNAME=$(get_metadata "mqtt-username" "")
     MQTT_PASSWORD=$(get_metadata "mqtt-password" "")
     TEST_TYPE=$(get_metadata "test-type" "connect")
@@ -118,8 +127,13 @@ main() {
     QOS=$(get_metadata "qos" "0")
     DURATION=$(get_metadata "duration" "60")
     EMQTT_VERSION=$(get_metadata "emqtt-version" "0.6.1")
-    USE_SSL=$(get_metadata "use-ssl" "false")
     USE_WEBSOCKET=$(get_metadata "use-websocket" "false")
+    
+    # SSL Certificate paths (optional)
+    SSL_CA_CERT=$(get_metadata "ssl-ca-cert" "")
+    SSL_CERT=$(get_metadata "ssl-cert" "")
+    SSL_KEY=$(get_metadata "ssl-key" "")
+    SSL_VERSION=$(get_metadata "ssl-version" "")
     
     # Validate required parameters
     if [ -z "$MQTT_HOST" ]; then
@@ -130,6 +144,15 @@ main() {
     log_info "Configuration loaded:"
     log_info "  MQTT Host: $MQTT_HOST"
     log_info "  MQTT Port: $MQTT_PORT"
+    log_info "  Use SSL: $USE_SSL"
+    if [ "$USE_SSL" = "true" ]; then
+        log_info "  SSL CA Cert: ${SSL_CA_CERT:-Not set (will skip verification)}"
+        log_info "  SSL Cert: ${SSL_CERT:-Not set}"
+        log_info "  SSL Key: ${SSL_KEY:-Not set}"
+        if [ -n "$SSL_VERSION" ]; then
+            log_info "  SSL Version: $SSL_VERSION"
+        fi
+    fi
     log_info "  Test Type: $TEST_TYPE"
     log_info "  Connections: $CONNECTIONS"
     log_info "  Interval: ${INTERVAL}ms"
@@ -162,17 +185,32 @@ main() {
         ARCH_SUFFIX="arm64"
     fi
     
-    # Try to download from GitHub releases
-    DOWNLOAD_URL="https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-${OS}-${ARCH_SUFFIX}.tar.gz"
+    # Try multiple URL patterns for GitHub releases
+    DOWNLOAD_URLS=(
+        "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-${OS}-${ARCH_SUFFIX}.tar.gz"
+        "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-${OS}-${ARCH_SUFFIX}-quic.tar.gz"
+        "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-linux-${ARCH_SUFFIX}.tar.gz"
+    )
     
-    log_info "Downloading emqtt-bench ${EMQTT_VERSION} from ${DOWNLOAD_URL}..."
+    DOWNLOAD_SUCCESS=false
+    for DOWNLOAD_URL in "${DOWNLOAD_URLS[@]}"; do
+        log_info "Trying to download from: ${DOWNLOAD_URL}..."
+        if wget -q --timeout=30 --tries=2 -O emqtt-bench.tar.gz "$DOWNLOAD_URL" 2>/dev/null; then
+            if [ -s emqtt-bench.tar.gz ]; then
+                DOWNLOAD_SUCCESS=true
+                log_info "Successfully downloaded emqtt-bench"
+                break
+            fi
+        fi
+        rm -f emqtt-bench.tar.gz
+    done
     
-    if ! wget -q --timeout=30 --tries=3 -O emqtt-bench.tar.gz "$DOWNLOAD_URL"; then
-        log_error "Failed to download emqtt-bench from GitHub releases"
-        log_info "Trying alternative download method..."
-        
-        # Alternative: try to build from source or use different URL pattern
-        log_error "Please check if the version and OS combination is available"
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+        log_error "Failed to download emqtt-bench from all attempted URLs"
+        log_error "Please check:"
+        log_error "  1. Version ${EMQTT_VERSION} exists at https://github.com/emqx/emqtt-bench/releases"
+        log_error "  2. OS ${OS} and architecture ${ARCH_SUFFIX} combination is available"
+        log_error "  3. Internet connectivity from this instance"
         exit 1
     fi
     
@@ -217,6 +255,23 @@ main() {
     
     if [ "$USE_SSL" = "true" ]; then
         CMD_ARGS+=(--ssl)
+        
+        # Add SSL certificate options if provided
+        if [ -n "$SSL_CA_CERT" ]; then
+            CMD_ARGS+=(--cacertfile "$SSL_CA_CERT")
+        fi
+        
+        if [ -n "$SSL_CERT" ]; then
+            CMD_ARGS+=(--certfile "$SSL_CERT")
+        fi
+        
+        if [ -n "$SSL_KEY" ]; then
+            CMD_ARGS+=(--keyfile "$SSL_KEY")
+        fi
+        
+        if [ -n "$SSL_VERSION" ]; then
+            CMD_ARGS+=(--ssl-version "$SSL_VERSION")
+        fi
     fi
     
     if [ "$USE_WEBSOCKET" = "true" ]; then
@@ -228,22 +283,52 @@ main() {
     mkdir -p "$LOG_DIR"
     LOG_FILE="$LOG_DIR/test-$(date +%Y%m%d-%H%M%S).log"
     
+    # Also log to syslog for easier monitoring
+    log_info "Test logs will be saved to: $LOG_FILE"
+    
     # Execute test based on type
     log_info "Starting test type: $TEST_TYPE"
     
+    TEST_EXIT_CODE=0
     case "$TEST_TYPE" in
         connect)
             log_info "Running connection test..."
-            "$EMQTT_BENCH_BIN" conn "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+            if ! "$EMQTT_BENCH_BIN" conn "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+                TEST_EXIT_CODE=$?
+                log_error "Connection test failed with exit code: $TEST_EXIT_CODE"
+            else
+                log_info "Connection test completed successfully"
+            fi
             ;;
         publish)
             log_info "Running publish test..."
-            CMD_ARGS+=(-L "$((DURATION * 1000 / INTERVAL))")  # Approximate message count
-            "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+            # Calculate approximate message count based on duration
+            MSG_COUNT=$((DURATION * 1000 / INTERVAL))
+            if [ "$MSG_COUNT" -eq 0 ]; then
+                MSG_COUNT=1
+            fi
+            CMD_ARGS+=(-L "$MSG_COUNT")
+            if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+                TEST_EXIT_CODE=$?
+                log_error "Publish test failed with exit code: $TEST_EXIT_CODE"
+            else
+                log_info "Publish test completed successfully"
+            fi
             ;;
         subscribe)
             log_info "Running subscribe test..."
-            timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE" || true
+            if ! timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+                TEST_EXIT_CODE=$?
+                # Timeout exit code is 124, which is expected
+                if [ "$TEST_EXIT_CODE" -eq 124 ]; then
+                    log_info "Subscribe test completed (timeout after ${DURATION}s)"
+                    TEST_EXIT_CODE=0
+                else
+                    log_error "Subscribe test failed with exit code: $TEST_EXIT_CODE"
+                fi
+            else
+                log_info "Subscribe test completed successfully"
+            fi
             ;;
         full)
             log_info "Running full test (publish + subscribe)..."
@@ -256,14 +341,32 @@ main() {
             # Wait a bit for subscribers to connect
             sleep 5
             
-            # Start publishers
-            log_info "Starting publishers..."
-            CMD_ARGS+=(-L "$((DURATION * 1000 / INTERVAL))")
-            "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
-            
-            # Wait for subscribers
-            sleep 5
-            kill $SUB_PID 2>/dev/null || true
+            # Check if subscriber process is still running
+            if ! kill -0 $SUB_PID 2>/dev/null; then
+                log_error "Subscriber process failed to start"
+                TEST_EXIT_CODE=1
+            else
+                # Start publishers
+                log_info "Starting publishers..."
+                MSG_COUNT=$((DURATION * 1000 / INTERVAL))
+                if [ "$MSG_COUNT" -eq 0 ]; then
+                    MSG_COUNT=1
+                fi
+                CMD_ARGS+=(-L "$MSG_COUNT")
+                if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+                    TEST_EXIT_CODE=$?
+                    log_error "Publish test failed with exit code: $TEST_EXIT_CODE"
+                else
+                    log_info "Publish test completed successfully"
+                fi
+                
+                # Wait a bit then stop subscribers
+                sleep 5
+                if kill $SUB_PID 2>/dev/null; then
+                    wait $SUB_PID 2>/dev/null || true
+                    log_info "Subscribers stopped"
+                fi
+            fi
             ;;
         *)
             log_error "Unknown test type: $TEST_TYPE"
@@ -273,7 +376,13 @@ main() {
     esac
     
     log_info "Test completed. Logs saved to: $LOG_FILE"
-    log_info "Setup and test execution finished successfully"
+    
+    if [ "$TEST_EXIT_CODE" -eq 0 ]; then
+        log_info "Setup and test execution finished successfully"
+    else
+        log_error "Test execution finished with errors (exit code: $TEST_EXIT_CODE)"
+        exit $TEST_EXIT_CODE
+    fi
 }
 
 # Run main function
