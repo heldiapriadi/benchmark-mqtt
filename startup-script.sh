@@ -29,33 +29,68 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Global log file for startup script
+STARTUP_LOG_FILE=""
+
 # Logging functions
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    local msg="[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "${GREEN}${msg}${NC}"
+    if [ -n "$STARTUP_LOG_FILE" ]; then
+        echo "$msg" >> "$STARTUP_LOG_FILE"
+    fi
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    local msg="[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "${YELLOW}${msg}${NC}"
+    if [ -n "$STARTUP_LOG_FILE" ]; then
+        echo "$msg" >> "$STARTUP_LOG_FILE"
+    fi
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    local msg="[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "${RED}${msg}${NC}"
+    if [ -n "$STARTUP_LOG_FILE" ]; then
+        echo "$msg" >> "$STARTUP_LOG_FILE"
+    fi
+}
+
+# Function to check if running on GCP
+is_gcp_instance() {
+    curl -s -f -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/id" >/dev/null 2>&1
 }
 
 # Function to get GCP instance metadata
+# Falls back to environment variables if not running on GCP
 get_metadata() {
     local key="$1"
     local default="${2:-}"
     
-    local value
-    value=$(curl -s -H "Metadata-Flavor: Google" \
-        "http://metadata.google.internal/computeMetadata/v1/instance/attributes/${key}" 2>/dev/null || echo "")
-    
-    if [ -z "$value" ]; then
-        echo "$default"
-    else
-        echo "$value"
+    # First try GCP metadata (if running on GCP)
+    if is_gcp_instance; then
+        local value
+        value=$(curl -s -f -H "Metadata-Flavor: Google" \
+            "http://metadata.google.internal/computeMetadata/v1/instance/attributes/${key}" 2>/dev/null || echo "")
+        
+        if [ -n "$value" ] && [ "$value" != "<!DOCTYPE html>" ]; then
+            echo "$value"
+            return
+        fi
     fi
+    
+    # Fallback to environment variable (convert key to env var format: mqtt-host -> MQTT_HOST)
+    local env_key
+    env_key=$(echo "$key" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+    if [ -n "${!env_key:-}" ]; then
+        echo "${!env_key}"
+        return
+    fi
+    
+    # Return default if nothing found
+    echo "$default"
 }
 
 # Function to detect OS architecture
@@ -103,9 +138,32 @@ detect_os() {
 
 # Main installation function
 main() {
-    log_info "Starting MQTT stress testing setup..."
+    # Create log directory early
+    LOG_DIR="/var/log/emqtt-bench"
+    mkdir -p "$LOG_DIR"
+    STARTUP_LOG_FILE="$LOG_DIR/startup-$(date +%Y%m%d-%H%M%S).log"
     
-    # Read configuration from metadata
+    # Log startup script execution
+    {
+        echo "=========================================="
+        echo "MQTT Stress Test Startup Script"
+        echo "Started: $(date)"
+        echo "=========================================="
+        echo ""
+    } >> "$STARTUP_LOG_FILE"
+    
+    log_info "Starting MQTT stress testing setup..."
+    log_info "Startup log: $STARTUP_LOG_FILE"
+    
+    # Check if running on GCP
+    if is_gcp_instance; then
+        log_info "Running on GCP instance - reading from metadata"
+    else
+        log_warn "Not running on GCP instance - using environment variables or defaults"
+        log_warn "Set environment variables like: MQTT_HOST, MQTT_PORT, etc."
+    fi
+    
+    # Read configuration from metadata (or environment variables)
     MQTT_HOST=$(get_metadata "mqtt-host" "")
     USE_SSL=$(get_metadata "use-ssl" "false")
     
@@ -137,7 +195,13 @@ main() {
     
     # Validate required parameters
     if [ -z "$MQTT_HOST" ]; then
-        log_error "mqtt-host metadata is required but not set"
+        log_error "mqtt-host is required but not set"
+        log_error "Set it via:"
+        if is_gcp_instance; then
+            log_error "  - GCP metadata: --metadata mqtt-host=your-host"
+        else
+            log_error "  - Environment variable: export MQTT_HOST=your-host"
+        fi
         exit 1
     fi
     
@@ -278,13 +342,31 @@ main() {
         CMD_ARGS+=(--ws)
     fi
     
-    # Create log directory
-    LOG_DIR="/var/log/emqtt-bench"
-    mkdir -p "$LOG_DIR"
+    # Test log file (separate from startup log)
     LOG_FILE="$LOG_DIR/test-$(date +%Y%m%d-%H%M%S).log"
     
-    # Also log to syslog for easier monitoring
     log_info "Test logs will be saved to: $LOG_FILE"
+    log_info "Startup logs: $STARTUP_LOG_FILE"
+    
+    # Write test configuration to log file
+    {
+        echo "=========================================="
+        echo "MQTT Stress Test Configuration"
+        echo "Started: $(date)"
+        echo "=========================================="
+        echo "MQTT Host: $MQTT_HOST"
+        echo "MQTT Port: $MQTT_PORT"
+        echo "Use SSL: $USE_SSL"
+        echo "Test Type: $TEST_TYPE"
+        echo "Connections: $CONNECTIONS"
+        echo "Interval: ${INTERVAL}ms"
+        echo "Topic: $TOPIC"
+        echo "Payload Size: $PAYLOAD_SIZE bytes"
+        echo "QoS: $QOS"
+        echo "Duration: ${DURATION}s"
+        echo "=========================================="
+        echo ""
+    } >> "$LOG_FILE"
     
     # Execute test based on type
     log_info "Starting test type: $TEST_TYPE"
@@ -293,7 +375,8 @@ main() {
     case "$TEST_TYPE" in
         connect)
             log_info "Running connection test..."
-            if ! "$EMQTT_BENCH_BIN" conn "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+            log_info "Command: $EMQTT_BENCH_BIN conn ${CMD_ARGS[*]}"
+            if ! "$EMQTT_BENCH_BIN" conn "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
                 log_error "Connection test failed with exit code: $TEST_EXIT_CODE"
             else
@@ -308,7 +391,8 @@ main() {
                 MSG_COUNT=1
             fi
             CMD_ARGS+=(-L "$MSG_COUNT")
-            if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+            log_info "Command: $EMQTT_BENCH_BIN pub ${CMD_ARGS[*]}"
+            if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
                 log_error "Publish test failed with exit code: $TEST_EXIT_CODE"
             else
@@ -317,7 +401,8 @@ main() {
             ;;
         subscribe)
             log_info "Running subscribe test..."
-            if ! timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+            log_info "Command: timeout $DURATION $EMQTT_BENCH_BIN sub ${CMD_ARGS[*]}"
+            if ! timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
                 # Timeout exit code is 124, which is expected
                 if [ "$TEST_EXIT_CODE" -eq 124 ]; then
@@ -335,8 +420,11 @@ main() {
             
             # Start subscribers in background
             log_info "Starting subscribers..."
-            "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" > "$LOG_DIR/subscribe.log" 2>&1 &
+            log_info "Subscriber command: $EMQTT_BENCH_BIN sub ${CMD_ARGS[*]}"
+            "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" >> "$LOG_DIR/subscribe.log" 2>&1 &
             SUB_PID=$!
+            log_info "Subscriber started with PID: $SUB_PID"
+            log_info "Subscriber logs: $LOG_DIR/subscribe.log"
             
             # Wait a bit for subscribers to connect
             sleep 5
@@ -344,6 +432,7 @@ main() {
             # Check if subscriber process is still running
             if ! kill -0 $SUB_PID 2>/dev/null; then
                 log_error "Subscriber process failed to start"
+                log_error "Check subscriber log: $LOG_DIR/subscribe.log"
                 TEST_EXIT_CODE=1
             else
                 # Start publishers
@@ -353,7 +442,8 @@ main() {
                     MSG_COUNT=1
                 fi
                 CMD_ARGS+=(-L "$MSG_COUNT")
-                if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"; then
+                log_info "Publisher command: $EMQTT_BENCH_BIN pub ${CMD_ARGS[*]}"
+                if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                     TEST_EXIT_CODE=$?
                     log_error "Publish test failed with exit code: $TEST_EXIT_CODE"
                 else
@@ -366,6 +456,17 @@ main() {
                     wait $SUB_PID 2>/dev/null || true
                     log_info "Subscribers stopped"
                 fi
+                
+                # Append subscriber log to main log
+                if [ -f "$LOG_DIR/subscribe.log" ]; then
+                    {
+                        echo ""
+                        echo "=========================================="
+                        echo "Subscriber Log"
+                        echo "=========================================="
+                        cat "$LOG_DIR/subscribe.log"
+                    } >> "$LOG_FILE"
+                fi
             fi
             ;;
         *)
@@ -375,7 +476,36 @@ main() {
             ;;
     esac
     
+    # Write summary to both logs
+    {
+        echo ""
+        echo "=========================================="
+        echo "Test Summary"
+        echo "Completed: $(date)"
+        echo "Exit Code: $TEST_EXIT_CODE"
+        echo "Test Log: $LOG_FILE"
+        echo "=========================================="
+    } >> "$LOG_FILE"
+    
+    {
+        echo ""
+        echo "=========================================="
+        echo "Startup Script Summary"
+        echo "Completed: $(date)"
+        echo "Test Exit Code: $TEST_EXIT_CODE"
+        echo "Test Log: $LOG_FILE"
+        echo "Startup Log: $STARTUP_LOG_FILE"
+        echo "=========================================="
+    } >> "$STARTUP_LOG_FILE"
+    
     log_info "Test completed. Logs saved to: $LOG_FILE"
+    log_info "Startup log saved to: $STARTUP_LOG_FILE"
+    
+    # List all log files
+    log_info "All log files in $LOG_DIR:"
+    ls -lh "$LOG_DIR" | tail -n +2 | while read -r line; do
+        log_info "  $line"
+    done
     
     if [ "$TEST_EXIT_CODE" -eq 0 ]; then
         log_info "Setup and test execution finished successfully"
