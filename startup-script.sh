@@ -242,6 +242,42 @@ main() {
     apt-get update -qq
     apt-get install -y -qq curl wget tar gzip ca-certificates
     
+    # Increase system limits for high connection count
+    log_info "Increasing system limits for high connection count..."
+    
+    # Increase file descriptor limit (current session)
+    ulimit -n 200000
+    CURRENT_ULIMIT=$(ulimit -n)
+    log_info "File descriptor limit set to: $CURRENT_ULIMIT"
+    
+    # Expand port range for more connections
+    sysctl -w net.ipv4.ip_local_port_range="1025 65534" >/dev/null 2>&1 || true
+    CURRENT_PORT_RANGE=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo "unknown")
+    log_info "Port range set to: $CURRENT_PORT_RANGE"
+    
+    # Make limits persistent (add to limits.conf)
+    if [ -f /etc/security/limits.conf ]; then
+        if ! grep -q "^\* soft nofile 200000" /etc/security/limits.conf 2>/dev/null; then
+            echo "* soft nofile 200000" >> /etc/security/limits.conf
+            echo "* hard nofile 200000" >> /etc/security/limits.conf
+            log_info "Added persistent file descriptor limits to /etc/security/limits.conf"
+        else
+            log_info "File descriptor limits already configured in /etc/security/limits.conf"
+        fi
+    fi
+    
+    # Make port range persistent (add to sysctl.conf)
+    if [ -f /etc/sysctl.conf ]; then
+        if ! grep -q "^net.ipv4.ip_local_port_range" /etc/sysctl.conf 2>/dev/null; then
+            echo "net.ipv4.ip_local_port_range = 1025 65534" >> /etc/sysctl.conf
+            log_info "Added persistent port range to /etc/sysctl.conf"
+        else
+            log_info "Port range already configured in /etc/sysctl.conf"
+        fi
+    fi
+    
+    log_info "System limits configured for high connection count support"
+    
     # Detect architecture and OS
     ARCH=$(detect_arch)
     OS=$(detect_os)
