@@ -147,8 +147,114 @@ detect_os() {
     fi
 }
 
+# Function to wait for dpkg lock to be released
+wait_for_dpkg_lock() {
+    local max_wait=300  # 5 minutes max wait
+    local wait_time=0
+    local check_interval=5
+    
+    log_info "Checking for dpkg lock..."
+    
+    while [ $wait_time -lt $max_wait ]; do
+        # Check for lock files
+        local lock_frontend_held=false
+        local lock_held=false
+        local apt_running=false
+        
+        # Check lock-frontend
+        if [ -f /var/lib/dpkg/lock-frontend ]; then
+            if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+                lock_frontend_held=true
+            fi
+        fi
+        
+        # Check lock
+        if [ -f /var/lib/dpkg/lock ]; then
+            if lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
+                lock_held=true
+            fi
+        fi
+        
+        # Check for running apt processes
+        if pgrep -x apt-get >/dev/null 2>&1 || pgrep -x apt >/dev/null 2>&1; then
+            apt_running=true
+        fi
+        
+        if [ "$lock_frontend_held" = false ] && [ "$lock_held" = false ] && [ "$apt_running" = false ]; then
+            log_info "dpkg lock released, proceeding with installation"
+            return 0
+        fi
+        
+        if [ $((wait_time % 30)) -eq 0 ]; then
+            log_info "dpkg lock still held (${wait_time}s/${max_wait}s) - waiting..."
+            if [ "$apt_running" = true ]; then
+                local apt_pids=$(pgrep -x apt-get 2>/dev/null | head -3 | tr '\n' ' ')
+                log_info "  Active apt processes: ${apt_pids:-none}"
+            fi
+        fi
+        
+        sleep $check_interval
+        wait_time=$((wait_time + check_interval))
+    done
+    
+    log_warn "dpkg lock wait timeout after ${max_wait}s, attempting to proceed anyway"
+    return 0
+}
+
+# Function to cleanup stuck apt processes
+cleanup_apt_processes() {
+    log_info "Checking for stuck apt processes..."
+    
+    # Wait a bit first for normal operations to complete
+    sleep 10
+    
+    # Check if apt is still running
+    if pgrep -x apt-get >/dev/null 2>&1 || pgrep -x apt >/dev/null 2>&1; then
+        log_warn "apt processes still running, waiting additional 30 seconds..."
+        sleep 30
+        
+        # If still running after additional wait, check if they're stuck
+        if pgrep -x apt-get >/dev/null 2>&1; then
+            local apt_pid=$(pgrep -x apt-get | head -1)
+            if [ -n "$apt_pid" ]; then
+                log_warn "apt-get process $apt_pid still running, checking if stuck..."
+                
+                # Try to get process runtime (may not work on all systems)
+                local process_start=$(ps -o lstart= -p "$apt_pid" 2>/dev/null || echo "")
+                if [ -n "$process_start" ]; then
+                    log_warn "  Process started at: $process_start"
+                fi
+                
+                # Check if process is actually doing something (not just stuck)
+                # Wait a bit more before killing
+                sleep 20
+                
+                if pgrep -x apt-get >/dev/null 2>&1; then
+                    log_warn "apt-get process appears stuck, attempting to kill..."
+                    kill -TERM "$apt_pid" 2>/dev/null || true
+                    sleep 5
+                    
+                    # Force kill if still running
+                    if pgrep -x apt-get >/dev/null 2>&1; then
+                        log_warn "Force killing stuck apt-get process..."
+                        kill -9 "$apt_pid" 2>/dev/null || true
+                        sleep 5
+                    fi
+                fi
+            fi
+        fi
+    fi
+    
+    log_info "apt process check completed"
+}
+
 # Main installation function
 main() {
+    # Wait for system initialization to complete
+    # This helps avoid race conditions with system updates
+    log_info "Waiting for system initialization to complete..."
+    sleep 15
+    
     # Create log directory early
     LOG_DIR="/var/log/emqtt-bench"
     mkdir -p "$LOG_DIR"
@@ -236,11 +342,73 @@ main() {
     log_info "  QoS: $QOS"
     log_info "  Duration: ${DURATION}s"
     
-    # Install dependencies
+    # Install dependencies with lock handling and retry logic
     log_info "Installing dependencies..."
+    
+    # Wait for dpkg lock to be released
+    wait_for_dpkg_lock
+    
+    # Cleanup any stuck apt processes
+    cleanup_apt_processes
+    
+    # Retry logic for apt-get operations
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq curl wget tar gzip ca-certificates
+    
+    MAX_RETRIES=3
+    RETRY_COUNT=0
+    INSTALL_SUCCESS=false
+    
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$INSTALL_SUCCESS" = false ]; do
+        log_info "Attempting to update package list (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+        
+        # Try to update package list with timeout
+        if timeout 300 apt-get update -qq 2>&1; then
+            log_info "Package list updated successfully"
+            
+            log_info "Installing required packages (curl, wget, tar, gzip, ca-certificates)..."
+            # Try to install packages with timeout
+            if timeout 600 apt-get install -y -qq curl wget tar gzip ca-certificates 2>&1; then
+                INSTALL_SUCCESS=true
+                log_info "Dependencies installed successfully"
+            else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                    log_warn "Package installation failed, retrying in 15 seconds..."
+                    sleep 15
+                    wait_for_dpkg_lock
+                    cleanup_apt_processes
+                else
+                    log_error "Package installation failed after $MAX_RETRIES attempts"
+                fi
+            fi
+        else
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                log_warn "Package update failed, retrying in 15 seconds..."
+                sleep 15
+                wait_for_dpkg_lock
+                cleanup_apt_processes
+            else
+                log_error "Package update failed after $MAX_RETRIES attempts"
+            fi
+        fi
+    done
+    
+    if [ "$INSTALL_SUCCESS" = false ]; then
+        log_error "Failed to install dependencies after $MAX_RETRIES attempts"
+        log_error "Please check system logs and try again"
+        exit 1
+    fi
+    
+    # Verify installed packages
+    log_info "Verifying installed packages..."
+    for pkg in curl wget tar gzip ca-certificates; do
+        if command -v "$pkg" >/dev/null 2>&1 || dpkg -l | grep -q "^ii.*$pkg"; then
+            log_info "  ✓ $pkg is available"
+        else
+            log_warn "  ✗ $pkg may not be properly installed"
+        fi
+    done
     
     # Increase system limits for high connection count
     log_info "Increasing system limits for high connection count..."
