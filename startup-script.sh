@@ -123,13 +123,17 @@ detect_os() {
                 echo "ubuntu${VERSION_ID%%.*}"
                 ;;
             debian)
-                # Map debian versions: debian11 -> try debian12 as fallback, debian12 -> debian12
+                # Map debian versions to compatible builds
+                # debian11 has GLIBC 2.31, debian12 builds need GLIBC 2.34
+                # Use ubuntu20.04 for debian11 (compatible GLIBC)
                 local debian_version="${VERSION_ID%%.*}"
                 if [ "$debian_version" = "11" ]; then
-                    # Try debian12 as it's more commonly available in releases
+                    # debian11 needs older GLIBC - use ubuntu20.04 build
+                    echo "ubuntu20.04"
+                elif [ "$debian_version" = "12" ]; then
                     echo "debian12"
                 else
-                    echo "debian${debian_version}"
+                    echo "ubuntu22.04"
                 fi
                 ;;
             *)
@@ -263,13 +267,14 @@ main() {
         "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-linux-${ARCH_SUFFIX}.tar.gz"
     )
     
-    # Add fallback for debian11 -> debian12 (debian11 builds may not be available)
-    if [[ "$OS" == "debian11" ]]; then
+    # Add fallback URLs for better compatibility
+    # Try ubuntu20.04 as universal fallback (older GLIBC, widely compatible)
+    if [[ "$OS" != "ubuntu20.04" ]]; then
         DOWNLOAD_URLS+=(
-            "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-debian12-${ARCH_SUFFIX}.tar.gz"
-            "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-debian12-${ARCH_SUFFIX}-quic.tar.gz"
+            "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-ubuntu20.04-${ARCH_SUFFIX}.tar.gz"
+            "https://github.com/emqx/emqtt-bench/releases/download/${EMQTT_VERSION}/emqtt-bench-${EMQTT_VERSION}-ubuntu22.04-${ARCH_SUFFIX}.tar.gz"
         )
-        log_info "Added debian12 fallback URLs for debian11"
+        log_info "Added ubuntu20.04/22.04 fallback URLs for GLIBC compatibility"
     fi
     
     DOWNLOAD_SUCCESS=false
@@ -313,50 +318,56 @@ main() {
     
     log_info "emqtt-bench installed successfully at $EMQTT_BENCH_BIN"
     
-    # Build command arguments
-    CMD_ARGS=(
+    # Build base command arguments (common for all test types)
+    BASE_ARGS=(
         -h "$MQTT_HOST"
         -p "$MQTT_PORT"
         -c "$CONNECTIONS"
-        -i "$INTERVAL"
-        -t "$TOPIC"
-        -s "$PAYLOAD_SIZE"
-        -q "$QOS"
     )
     
-    # Add optional parameters
+    # Add optional authentication
     if [ -n "$MQTT_USERNAME" ]; then
-        CMD_ARGS+=(-u "$MQTT_USERNAME")
+        BASE_ARGS+=(-u "$MQTT_USERNAME")
     fi
     
     if [ -n "$MQTT_PASSWORD" ]; then
-        CMD_ARGS+=(-P "$MQTT_PASSWORD")
+        BASE_ARGS+=(-P "$MQTT_PASSWORD")
     fi
     
+    # Add SSL options
     if [ "$USE_SSL" = "true" ]; then
-        CMD_ARGS+=(--ssl)
+        BASE_ARGS+=(--ssl)
         
-        # Add SSL certificate options if provided
         if [ -n "$SSL_CA_CERT" ]; then
-            CMD_ARGS+=(--cacertfile "$SSL_CA_CERT")
+            BASE_ARGS+=(--cacertfile "$SSL_CA_CERT")
         fi
         
         if [ -n "$SSL_CERT" ]; then
-            CMD_ARGS+=(--certfile "$SSL_CERT")
+            BASE_ARGS+=(--certfile "$SSL_CERT")
         fi
         
         if [ -n "$SSL_KEY" ]; then
-            CMD_ARGS+=(--keyfile "$SSL_KEY")
+            BASE_ARGS+=(--keyfile "$SSL_KEY")
         fi
         
         if [ -n "$SSL_VERSION" ]; then
-            CMD_ARGS+=(--ssl-version "$SSL_VERSION")
+            BASE_ARGS+=(--ssl-version "$SSL_VERSION")
         fi
     fi
     
     if [ "$USE_WEBSOCKET" = "true" ]; then
-        CMD_ARGS+=(--ws)
+        BASE_ARGS+=(--ws)
     fi
+    
+    # Build test-specific arguments
+    # For connect: only base args (no topic, interval, payload, qos)
+    # For publish/subscribe/full: add topic, interval, payload, qos
+    PUB_SUB_ARGS=(
+        -t "$TOPIC"
+        -i "$INTERVAL"
+        -s "$PAYLOAD_SIZE"
+        -q "$QOS"
+    )
     
     # Test log file (separate from startup log)
     LOG_FILE="$LOG_DIR/test-$(date +%Y%m%d-%H%M%S).log"
@@ -391,8 +402,10 @@ main() {
     case "$TEST_TYPE" in
         connect)
             log_info "Running connection test..."
-            log_info "Command: $EMQTT_BENCH_BIN conn ${CMD_ARGS[*]}"
-            if ! "$EMQTT_BENCH_BIN" conn "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            # For connect test: only use base args (no topic, interval, payload, qos)
+            CONN_ARGS=("${BASE_ARGS[@]}")
+            log_info "Command: $EMQTT_BENCH_BIN conn ${CONN_ARGS[*]}"
+            if ! "$EMQTT_BENCH_BIN" conn "${CONN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
                 log_error "Connection test failed with exit code: $TEST_EXIT_CODE"
             else
@@ -401,14 +414,16 @@ main() {
             ;;
         publish)
             log_info "Running publish test..."
+            # For publish: base args + topic, interval, payload, qos
+            PUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
             # Calculate approximate message count based on duration
             MSG_COUNT=$((DURATION * 1000 / INTERVAL))
             if [ "$MSG_COUNT" -eq 0 ]; then
                 MSG_COUNT=1
             fi
-            CMD_ARGS+=(-L "$MSG_COUNT")
-            log_info "Command: $EMQTT_BENCH_BIN pub ${CMD_ARGS[*]}"
-            if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            PUB_ARGS+=(-L "$MSG_COUNT")
+            log_info "Command: $EMQTT_BENCH_BIN pub ${PUB_ARGS[*]}"
+            if ! "$EMQTT_BENCH_BIN" pub "${PUB_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
                 log_error "Publish test failed with exit code: $TEST_EXIT_CODE"
             else
@@ -417,8 +432,10 @@ main() {
             ;;
         subscribe)
             log_info "Running subscribe test..."
-            log_info "Command: timeout $DURATION $EMQTT_BENCH_BIN sub ${CMD_ARGS[*]}"
-            if ! timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            # For subscribe: base args + topic, interval, payload, qos
+            SUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
+            log_info "Command: timeout $DURATION $EMQTT_BENCH_BIN sub ${SUB_ARGS[*]}"
+            if ! timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${SUB_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
                 # Timeout exit code is 124, which is expected
                 if [ "$TEST_EXIT_CODE" -eq 124 ]; then
@@ -434,10 +451,14 @@ main() {
         full)
             log_info "Running full test (publish + subscribe)..."
             
+            # For full test: base args + topic, interval, payload, qos
+            SUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
+            PUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
+            
             # Start subscribers in background
             log_info "Starting subscribers..."
-            log_info "Subscriber command: $EMQTT_BENCH_BIN sub ${CMD_ARGS[*]}"
-            "$EMQTT_BENCH_BIN" sub "${CMD_ARGS[@]}" >> "$LOG_DIR/subscribe.log" 2>&1 &
+            log_info "Subscriber command: $EMQTT_BENCH_BIN sub ${SUB_ARGS[*]}"
+            "$EMQTT_BENCH_BIN" sub "${SUB_ARGS[@]}" >> "$LOG_DIR/subscribe.log" 2>&1 &
             SUB_PID=$!
             log_info "Subscriber started with PID: $SUB_PID"
             log_info "Subscriber logs: $LOG_DIR/subscribe.log"
@@ -457,9 +478,9 @@ main() {
                 if [ "$MSG_COUNT" -eq 0 ]; then
                     MSG_COUNT=1
                 fi
-                CMD_ARGS+=(-L "$MSG_COUNT")
-                log_info "Publisher command: $EMQTT_BENCH_BIN pub ${CMD_ARGS[*]}"
-                if ! "$EMQTT_BENCH_BIN" pub "${CMD_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                PUB_ARGS+=(-L "$MSG_COUNT")
+                log_info "Publisher command: $EMQTT_BENCH_BIN pub ${PUB_ARGS[*]}"
+                if ! "$EMQTT_BENCH_BIN" pub "${PUB_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                     TEST_EXIT_CODE=$?
                     log_error "Publish test failed with exit code: $TEST_EXIT_CODE"
                 else
