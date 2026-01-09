@@ -564,12 +564,12 @@ main() {
     fi
     
     # Build test-specific arguments
-    # For connect: only base args (no topic, interval, payload, qos)
-    # For publish: base args + topic, interval, payload, qos
+    # For connect: base args + connect interval (-i) only
+    # For publish: base args + topic, message interval (-I), payload, qos
     # For subscribe: base args + topic, qos (no payload, no interval)
     PUB_ARGS_EXTRA=(
         -t "$TOPIC"
-        -i "$INTERVAL"
+        -I "$INTERVAL"     # emqtt_bench pub: -I / --interval_of_msg
         -s "$PAYLOAD_SIZE"
         -q "$QOS"
     )
@@ -612,8 +612,8 @@ main() {
     case "$TEST_TYPE" in
         connect)
             log_info "Running connection test..."
-            # For connect test: only use base args (no topic, interval, payload, qos)
-            CONN_ARGS=("${BASE_ARGS[@]}")
+            # For connect test: base args + connect interval (-i)
+            CONN_ARGS=("${BASE_ARGS[@]}" -i "$INTERVAL")
             log_info "Command: $EMQTT_BENCH_BIN conn ${CONN_ARGS[*]}"
             if ! "$EMQTT_BENCH_BIN" conn "${CONN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
