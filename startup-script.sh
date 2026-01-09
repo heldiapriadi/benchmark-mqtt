@@ -565,11 +565,17 @@ main() {
     
     # Build test-specific arguments
     # For connect: only base args (no topic, interval, payload, qos)
-    # For publish/subscribe/full: add topic, interval, payload, qos
-    PUB_SUB_ARGS=(
+    # For publish: base args + topic, interval, payload, qos
+    # For subscribe: base args + topic, qos (no payload, no interval)
+    PUB_ARGS_EXTRA=(
         -t "$TOPIC"
         -i "$INTERVAL"
         -s "$PAYLOAD_SIZE"
+        -q "$QOS"
+    )
+
+    SUB_ARGS_EXTRA=(
+        -t "$TOPIC"
         -q "$QOS"
     )
     
@@ -619,7 +625,7 @@ main() {
         publish)
             log_info "Running publish test..."
             # For publish: base args + topic, interval, payload, qos
-            PUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
+            PUB_ARGS=("${BASE_ARGS[@]}" "${PUB_ARGS_EXTRA[@]}")
             # Calculate approximate message count based on duration
             MSG_COUNT=$((DURATION * 1000 / INTERVAL))
             if [ "$MSG_COUNT" -eq 0 ]; then
@@ -636,8 +642,8 @@ main() {
             ;;
         subscribe)
             log_info "Running subscribe test..."
-            # For subscribe: base args + topic, interval, payload, qos
-            SUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
+            # For subscribe: base args + topic, qos (no payload size, no interval)
+            SUB_ARGS=("${BASE_ARGS[@]}" "${SUB_ARGS_EXTRA[@]}")
             log_info "Command: timeout $DURATION $EMQTT_BENCH_BIN sub ${SUB_ARGS[*]}"
             if ! timeout "$DURATION" "$EMQTT_BENCH_BIN" sub "${SUB_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
                 TEST_EXIT_CODE=$?
@@ -656,8 +662,10 @@ main() {
             log_info "Running full test (publish + subscribe)..."
             
             # For full test: base args + topic, interval, payload, qos
-            SUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
-            PUB_ARGS=("${BASE_ARGS[@]}" "${PUB_SUB_ARGS[@]}")
+            # Subscribers: base args + topic, qos
+            # Publishers: base args + topic, interval, payload, qos
+            SUB_ARGS=("${BASE_ARGS[@]}" "${SUB_ARGS_EXTRA[@]}")
+            PUB_ARGS=("${BASE_ARGS[@]}" "${PUB_ARGS_EXTRA[@]}")
             
             # Start subscribers in background
             log_info "Starting subscribers..."
